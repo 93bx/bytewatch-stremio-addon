@@ -13,6 +13,7 @@ const { prewarmPool } = require('./browser-pool');
 const PORT = process.env.PORT || 7000;
 const PROTECTED_STREAM_CACHE_TTL = 1800;
 const insecureAgent = new https.Agent({ rejectUnauthorized: false });
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`).replace(/\/+$/, '');
 
 const builder = new addonBuilder({
     id: 'org.bytetan.bytewatch',
@@ -103,11 +104,15 @@ function createProxyToken(candidate) {
     return token;
 }
 
+function buildProxyUrl(token, targetUrl) {
+    return `${PUBLIC_BASE_URL}/proxy/${token}?u=${encodeURIComponent(targetUrl)}`;
+}
+
 function mapCandidateToStream(candidate, description) {
     const token = createProxyToken(candidate);
     return {
         name: `${sourceLabel(candidate.source)} (${candidate.score})`,
-        url: `http://127.0.0.1:${PORT}/proxy/${token}?u=${encodeURIComponent(candidate.url)}`,
+        url: buildProxyUrl(token, candidate.url),
         description,
         behaviorHints: {
             notWebReady: true
@@ -268,12 +273,12 @@ function rewriteManifestUrls(manifestText, streamUrl, token) {
         if (trimmed.startsWith('#EXT-X-KEY') && trimmed.includes('URI=')) {
             return line.replace(/URI="([^"]+)"/, (_match, uri) => {
                 const absolute = new URL(uri, streamUrl).toString();
-                return `URI="http://127.0.0.1:${PORT}/proxy/${token}?u=${encodeURIComponent(absolute)}"`;
+                return `URI="${buildProxyUrl(token, absolute)}"`;
             });
         }
         if (trimmed.startsWith('#')) return line;
         const absolute = new URL(trimmed, streamUrl).toString();
-        return `http://127.0.0.1:${PORT}/proxy/${token}?u=${encodeURIComponent(absolute)}`;
+        return buildProxyUrl(token, absolute);
     }).join('\n');
 }
 
