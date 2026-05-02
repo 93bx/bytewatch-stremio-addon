@@ -8,6 +8,7 @@ const getRouter = require('stremio-addon-sdk/src/getRouter');
 const { performance } = require('node:perf_hooks');
 const logger = require('./logger');
 const extractor = require('./unified-extractor');
+const { prewarmPool } = require('./browser-pool');
 
 const PORT = process.env.PORT || 7000;
 const PROTECTED_STREAM_CACHE_TTL = 1800;
@@ -329,6 +330,7 @@ async function startServer() {
     });
     app.listen(PORT, '0.0.0.0', () => {
         logger.info(`Addon running on port ${PORT}`);
+        prewarmPool();
     });
 }
 
