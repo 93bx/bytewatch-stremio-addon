@@ -12,13 +12,40 @@
   "author": "93bx",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.9.0",
+    "axios": "^1.15.2",
     "node-cache": "^5.1.2",
-    "puppeteer-real-browser": "^1.4.2",
-    "stremio-addon-sdk": "^1.1.6",
-    "winston": "^3.17.0",
+    "puppeteer-real-browser": "^1.4.4",
+    "stremio-addon-sdk": "^1.6.10",
+    "winston": "^3.19.0",
     "xvfb": "^0.4.0"
-  }, "devDependencies": {
-    "@vercel/node": "^3.0.0"
+  },
+  "devDependencies": {
+    "@vercel/node": "^5.7.15"
+  },
+  "overrides": {
+    "basic-ftp": "^5.3.1",
+    "lodash": "^4.17.24",
+    "qs": "^6.15.1",
+    "tmp": "^0.2.5",
+    "form-data": "^4.0.4",
+    "follow-redirects": "^1.15.12",
+    "brace-expansion": "^1.1.13",
+    "tar": "^7.5.11",
+    "tar-fs": "^3.1.2",
+    "minimatch": "^3.1.5",
+    "ajv": "^8.20.0",
+    "undici": "^6.24.0",
+    "smol-toml": "^1.6.1",
+    "@vercel/node": {
+      "path-to-regexp": "^6.3.0"
+    },
+    "stremio-addon-sdk": {
+      "express": {
+        "path-to-regexp": "0.1.13"
+      },
+      "router": {
+        "path-to-regexp": "0.1.13"
+      }
+    }
   }
 }
