@@ -321,19 +321,13 @@ async function extractAllStreams({type, imdbId, season, episode}) {
     }
 
     const [
-        wooflixResult,
         fmoviesResult,
         vidoraResult,
         videasyResult,
-        viloraResult,
-        vidsrcResult,
     ] = await Promise.allSettled([
-        extractor('wooflix', type, id, season, episode),
         extractor('fmovies', type, id, season, episode),
         extractor('vidora', type, id, season, episode),
         extractor('videasy', type, id, season, episode),
-        extractor('vilora', type, id, season, episode),
-        extractor('vidsrc', type, id, season, episode),
     ]);
 
     if (fmoviesResult.status === 'fulfilled' && fmoviesResult.value) {
@@ -342,14 +336,6 @@ async function extractAllStreams({type, imdbId, season, episode}) {
         }
     } else {
         console.warn('❌ Fmovies extraction failed:', fmoviesResult.reason?.message);
-    }
-
-    if (wooflixResult.status === 'fulfilled' && wooflixResult.value) {
-        for (const label in wooflixResult.value) {
-            streams[label] = wooflixResult.value[label];
-        }
-    } else {
-        console.warn('❌ wooflix extraction failed:', wooflixResult.reason?.message);
     }
 
     if (vidoraResult.status === 'fulfilled' && vidoraResult.value) {
@@ -366,22 +352,6 @@ async function extractAllStreams({type, imdbId, season, episode}) {
         }
     } else {
         console.warn('❌ VideasyResult extraction failed:', vidoraResult.reason?.message);
-    }
-
-    if (viloraResult.status === 'fulfilled' && viloraResult.value) {
-        for (const label in viloraResult.value) {
-            streams[label] = viloraResult.value[label];
-        }
-    } else {
-        console.warn('❌ Vilora Result extraction failed:', viloraResult.reason?.message);
-    }
-
-    if (vidsrcResult.status === 'fulfilled' && vidsrcResult.value) {
-        for (const label in vidsrcResult.value) {
-            streams[label] = vidsrcResult.value[label];
-        }
-    } else {
-        console.warn('❌ VidSrc Result extraction failed:', vidsrcResult.reason?.message);
     }
 
     return streams;

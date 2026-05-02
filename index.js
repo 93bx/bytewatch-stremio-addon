@@ -1,10 +1,17 @@
-const { addonBuilder, serveHTTP }  = require('stremio-addon-sdk');
+const { addonBuilder }  = require('stremio-addon-sdk');
 const NodeCache = require('node-cache');
 const axios = require('axios');
+const https = require('https');
+const crypto = require('crypto');
+const express = require('express');
+const getRouter = require('stremio-addon-sdk/src/getRouter');
+const { performance } = require('node:perf_hooks');
 const logger = require('./logger');
 const extractor = require('./unified-extractor');
 
 const PORT = process.env.PORT || 7000;
+const PROTECTED_STREAM_CACHE_TTL = 1800;
+const insecureAgent = new https.Agent({ rejectUnauthorized: false });
 
 const builder = new addonBuilder({
     id: 'org.bytetan.bytewatch',
@@ -18,8 +25,27 @@ const builder = new addonBuilder({
     idPrefixes: ['tt']
 });
 
-// Setup cache to reduce load (cache for 2 hours)
-const streamCache = new NodeCache({ stdTTL: 7200, checkperiod: 120 });
+// Setup cache to reduce load (shorter TTL for protected session-bound links)
+const streamCache = new NodeCache({ stdTTL: PROTECTED_STREAM_CACHE_TTL, checkperiod: 120 });
+const proxySessionCache = new NodeCache({ stdTTL: PROTECTED_STREAM_CACHE_TTL, checkperiod: 120 });
+const tmdbFindCache = new NodeCache({ stdTTL: 86400, checkperiod: 600 });
+
+const ALLOWED_EXTRACTOR_SOURCES = new Set(['cineby', 'vidking']);
+
+function streamTimingEnabled() {
+    return process.env.STREAM_TIMING === '1';
+}
+
+function logStreamTiming(label, startedAt) {
+    if (!streamTimingEnabled()) return;
+    logger.info(`timing ${label}=${(performance.now() - startedAt).toFixed(1)}ms`);
+}
+
+function resolveExtractorSources() {
+    const raw = (process.env.SOURCES || 'cineby,vidking').split(',').map((s) => s.trim()).filter(Boolean);
+    const picked = raw.filter((s) => ALLOWED_EXTRACTOR_SOURCES.has(s));
+    return picked.length ? picked : ['cineby', 'vidking'];
+}
 
 // Fetch movie data
 async function fetchOmdbDetails(imdbId){
@@ -33,6 +59,16 @@ async function fetchOmdbDetails(imdbId){
     console.log(`Error fetching metadata: ${e}`)
     return null
   }
+}
+
+async function resolveTmdbFind(imdbId) {
+    const cached = tmdbFindCache.get(imdbId);
+    if (cached) return cached;
+    const data = await fetchTmdbId(imdbId);
+    if (data && (data.movie_results?.length || data.tv_results?.length)) {
+        tmdbFindCache.set(imdbId, data);
+    }
+    return data;
 }
 
 // Fetch TMDB ID
@@ -53,125 +89,137 @@ async function fetchTmdbId(imdbId){
   }
 }
 
+function sourceLabel(source) {
+    return source.charAt(0).toUpperCase() + source.slice(1);
+}
+
+function createProxyToken(candidate) {
+    const token = crypto.randomUUID();
+    proxySessionCache.set(token, {
+        source: candidate.source,
+        requestHeaders: candidate.requestHeaders || {}
+    });
+    return token;
+}
+
+function mapCandidateToStream(candidate, description) {
+    const token = createProxyToken(candidate);
+    return {
+        name: `${sourceLabel(candidate.source)} (${candidate.score})`,
+        url: `http://127.0.0.1:${PORT}/proxy/${token}?u=${encodeURIComponent(candidate.url)}`,
+        description,
+        behaviorHints: {
+            notWebReady: true
+        }
+    };
+}
+
+function normalizeCached(cached) {
+    if (!cached) return [];
+    if (Array.isArray(cached)) return cached;
+    return [];
+}
+
 // Main extraction function
-async function extractAllStreams({type, imdbId, season, episode}) {
-    const streams = {};
-    const tmdbRes = await fetchTmdbId(imdbId);
+async function extractAllStreams({ type, imdbId, season, episode, tmdbRes: tmdbResInput }) {
+    const streams = [];
+    const tExtractStart = performance.now();
+    const tmdbRes = tmdbResInput !== undefined && tmdbResInput !== null
+        ? tmdbResInput
+        : await resolveTmdbFind(imdbId);
 
     const id = type === 'movie'
-        ? tmdbRes['movie_results'][0]?.id
-        : tmdbRes['tv_results'][0]?.id;
+        ? tmdbRes?.movie_results?.[0]?.id
+        : tmdbRes?.tv_results?.[0]?.id;
 
     if (!id) {
         console.warn('❌ TMDB ID not found');
         return streams;
     }
 
-    const [
-        wooflixResult,
-        viloraResult,
-        vidsrcResult,
-        vidjoyResult,
-        vidifyResult
-    ] = await Promise.allSettled([
-        extractor('wooflix', type, id, season, episode),
-        extractor('vilora', type, id, season, episode),
-        extractor('vidsrc', type, id, season, episode),
-        extractor('vidjoy', type, id, season, episode),
-        extractor('vidify', type, id, season, episode)
-    ]);
+    const sources = resolveExtractorSources();
+    const settled = await Promise.allSettled(
+        sources.map((source) => extractor(source, type, id, season, episode))
+    );
 
-    if (wooflixResult.status === 'fulfilled' && wooflixResult.value) {
-        for (const label in wooflixResult.value) {
-            streams[label] = wooflixResult.value[label];
+    const results = settled;
+
+    for (const result of results) {
+        if (result.status === 'fulfilled' && result.value && result.value.bestCandidate) {
+            streams.push(result.value.bestCandidate);
+        } else if (result.status === 'rejected') {
+            console.warn('❌ source extraction failed:', result.reason?.message);
+        } else if (result.status === 'fulfilled' && result.value) {
+            console.warn(`❌ ${result.value.source} extraction had no playable candidate: ${result.value.error || 'no candidate'}`);
         }
-    } else {
-        console.warn('❌ wooflix extraction failed:', wooflixResult.reason?.message);
     }
 
-    if (viloraResult.status === 'fulfilled' && viloraResult.value) {
-        for (const label in viloraResult.value) {
-            streams[label] = viloraResult.value[label];
-        }
-    } else {
-        console.warn('❌ Vilora Result extraction failed:', viloraResult.reason?.message);
-    }
+    const sorted = streams.sort((a, b) => b.score - a.score);
+    logStreamTiming(`extractAllStreams sources=${sources.join(',')}`, tExtractStart);
+    return sorted;
+}
 
-    if (vidsrcResult.status === 'fulfilled' && vidsrcResult.value) {
-        for (const label in vidsrcResult.value) {
-            streams[label] = vidsrcResult.value[label];
-        }
-    } else {
-        console.warn('❌ VidSrc Result extraction failed:', vidsrcResult.reason?.message);
+function movieStreamDescription(metadata, imdbId) {
+    if (metadata && metadata.Title) {
+        return `${metadata.Title} (${metadata.Year || '?'})`;
     }
+    return imdbId;
+}
 
-    if (vidjoyResult.status === 'fulfilled' && vidjoyResult.value) {
-        for (const label in vidjoyResult.value) {
-            streams[label] = vidjoyResult.value[label];
-        }
-    } else {
-        console.warn('❌ Vidjoy Result extraction failed:', vidjoyResult.reason?.message);
+function seriesStreamDescription(metadata, imdbId, season, episode) {
+    if (metadata && metadata.Title) {
+        return `${metadata.Title} S${season}E${episode}`;
     }
-
-    if (vidifyResult.status === 'fulfilled' && vidifyResult.value) {
-        for (const label in vidifyResult.value) {
-            streams[label] = vidifyResult.value[label];
-        }
-    } else {
-        console.warn('❌ Vidify Result extraction failed:', vidifyResult.reason?.message);
-    }
-
-    return streams;
+    return `${imdbId} S${season}E${episode}`;
 }
 
 // Function to handle streams for movies
 async function getMovieStreams(imdbId) {
     const cacheKey = `movie:${imdbId}`;
-    const metadata = await fetchOmdbDetails(imdbId);
+    const tHandler = performance.now();
 
-    // Check cache first
-    const cached = streamCache.get(cacheKey);
-    if (cached) {
+    const cached = normalizeCached(streamCache.get(cacheKey));
+    if (cached.length) {
         console.log(`Using cached stream for movie ${imdbId}`);
-        return Object.entries(cached).map(([name, url]) => ({
-            name,
-            url,
-            description: `${metadata.Title} (${metadata.Year})`
-        }));
+        const out = cached.map((candidate) => mapCandidateToStream(candidate, `${imdbId} (cached)`));
+        logStreamTiming('getMovieStreams cache_hit', tHandler);
+        return out;
     }
-    const streams = await extractAllStreams({ type: 'movie', imdbId });
+
+    const tMeta = performance.now();
+    const [tmdbRes, metadata] = await Promise.all([resolveTmdbFind(imdbId), fetchOmdbDetails(imdbId)]);
+    logStreamTiming('getMovieStreams meta_parallel', tMeta);
+
+    const streams = await extractAllStreams({ type: 'movie', imdbId, tmdbRes });
     streamCache.set(cacheKey, streams);
 
-    return Object.entries(streams).map(([name, url]) => ({
-        name,
-        url,
-        description: `${metadata.Title} (${metadata.Year})`
-    }));
+    const desc = movieStreamDescription(metadata, imdbId);
+    logStreamTiming('getMovieStreams cache_miss_total', tHandler);
+    return streams.map((candidate) => mapCandidateToStream(candidate, desc));
 }
 
 // Function to handle streams for TV series
 async function getSeriesStreams(imdbId, season, episode) {
     const cacheKey = `series:${imdbId}:${season}:${episode}`;
-    const metadata = await fetchOmdbDetails(imdbId);
+    const tHandler = performance.now();
 
-    // Check cache first
-    const cached = streamCache.get(cacheKey);
-    if (cached) {
+    const cached = normalizeCached(streamCache.get(cacheKey));
+    if (cached.length) {
         console.log(`Using cached stream for series ${imdbId} S${season}E${episode}`);
-        return Object.entries(cached).map(([name, url]) => ({
-            name,
-            url,
-            description: `${metadata.Title} S${season}E${episode}`
-        }));
+        const out = cached.map((candidate) => mapCandidateToStream(candidate, `${imdbId} S${season}E${episode} (cached)`));
+        logStreamTiming('getSeriesStreams cache_hit', tHandler);
+        return out;
     }
 
-    const streams = await extractAllStreams({ type: 'series', imdbId, season, episode });
-    // streamCache.set(cacheKey, streams);
-    return Object.entries(streams).map(([name, url]) => ({
-        name,
-        url,
-        description: `${metadata.Title} S${season}E${episode}`
-    }));
+    const tMeta = performance.now();
+    const [tmdbRes, metadata] = await Promise.all([resolveTmdbFind(imdbId), fetchOmdbDetails(imdbId)]);
+    logStreamTiming('getSeriesStreams meta_parallel', tMeta);
+
+    const streams = await extractAllStreams({ type: 'series', imdbId, season, episode, tmdbRes });
+    streamCache.set(cacheKey, streams);
+    const desc = seriesStreamDescription(metadata, imdbId, season, episode);
+    logStreamTiming('getSeriesStreams cache_miss_total', tHandler);
+    return streams.map((candidate) => mapCandidateToStream(candidate, desc));
 }
 
 
@@ -199,5 +247,105 @@ builder.defineStreamHandler(async ({type, id}) => {
     }
 });
 
-serveHTTP(builder.getInterface(), {port: PORT, hostname: "0.0.0.0"})
-logger.info(`Addon running on port ${PORT}`);
+function buildForwardHeaders(requestHeaders = {}, range) {
+    const headers = {
+        Referer: requestHeaders.Referer,
+        Origin: requestHeaders.Origin,
+        "User-Agent": requestHeaders["User-Agent"],
+        "Accept-Language": requestHeaders["Accept-Language"],
+        Accept: "*/*"
+    };
+    if (range) headers.Range = range;
+    return headers;
+}
+
+function rewriteManifestUrls(manifestText, streamUrl, token) {
+    const lines = String(manifestText).split('\n');
+    return lines.map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return line;
+        if (trimmed.startsWith('#EXT-X-KEY') && trimmed.includes('URI=')) {
+            return line.replace(/URI="([^"]+)"/, (_match, uri) => {
+                const absolute = new URL(uri, streamUrl).toString();
+                return `URI="http://127.0.0.1:${PORT}/proxy/${token}?u=${encodeURIComponent(absolute)}"`;
+            });
+        }
+        if (trimmed.startsWith('#')) return line;
+        const absolute = new URL(trimmed, streamUrl).toString();
+        return `http://127.0.0.1:${PORT}/proxy/${token}?u=${encodeURIComponent(absolute)}`;
+    }).join('\n');
+}
+
+async function startServer() {
+    const app = express();
+    app.use(getRouter(builder.getInterface()));
+    app.get('/proxy/:token', async (req, res) => {
+        const session = proxySessionCache.get(req.params.token);
+        const targetUrl = req.query.u;
+        if (!session || !targetUrl || Array.isArray(targetUrl)) {
+            return res.status(400).send('Invalid proxy request');
+        }
+
+        try {
+            const upstream = await axios.get(targetUrl, {
+                responseType: 'stream',
+                timeout: 20000,
+                validateStatus: () => true,
+                headers: buildForwardHeaders(session.requestHeaders, req.headers.range),
+                httpsAgent: insecureAgent
+            });
+
+            if (targetUrl.includes('.m3u8')) {
+                const chunks = [];
+                upstream.data.on('data', (chunk) => chunks.push(chunk));
+                upstream.data.on('error', () => res.status(502).send('Proxy stream read error'));
+                upstream.data.on('end', () => {
+                    const manifest = Buffer.concat(chunks).toString('utf8');
+                    const rewritten = rewriteManifestUrls(manifest, targetUrl, req.params.token);
+                    res.status(upstream.status);
+                    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+                    res.send(rewritten);
+                });
+                return;
+            }
+
+            res.status(upstream.status);
+            const contentType = upstream.headers['content-type'];
+            const contentLength = upstream.headers['content-length'];
+            const acceptRanges = upstream.headers['accept-ranges'];
+            const contentRange = upstream.headers['content-range'];
+            if (contentType) res.setHeader('content-type', contentType);
+            if (contentLength) res.setHeader('content-length', contentLength);
+            if (acceptRanges) res.setHeader('accept-ranges', acceptRanges);
+            if (contentRange) res.setHeader('content-range', contentRange);
+            upstream.data.pipe(res);
+        } catch (error) {
+            logger.warn(`Proxy error: ${error.message}`);
+            res.status(502).send('Proxy error');
+        }
+    });
+    app.get('/', (_req, res) => {
+        res.redirect('/manifest.json');
+    });
+    app.listen(PORT, '0.0.0.0', () => {
+        logger.info(`Addon running on port ${PORT}`);
+    });
+}
+
+if (require.main === module) {
+    startServer().catch((error) => {
+        logger.error(`Failed to start server: ${error.message}`);
+    });
+}
+
+function flushStreamCachesForBenchmark() {
+    streamCache.flushAll();
+    proxySessionCache.flushAll();
+}
+
+module.exports = {
+    extractAllStreams,
+    resolveTmdbFind,
+    fetchOmdbDetails,
+    flushStreamCachesForBenchmark,
+};
