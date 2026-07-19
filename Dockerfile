@@ -15,9 +15,11 @@ RUN apt-get update -qq \
 
 WORKDIR /app
 
-# Install dependencies first (better layer caching)
+# Install dependencies first (better layer caching).
+# npm ci gives reproducible installs from the committed lockfile; the postinstall
+# step downloads the puppeteer-managed Chrome build used by puppeteer-real-browser.
 COPY package.json package-lock.json ./
-RUN npm install
+RUN npm ci --omit=dev
 
 # Copy the rest of the app
 COPY . .

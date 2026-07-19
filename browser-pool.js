@@ -58,8 +58,11 @@ let connectPromise = null;
 const slotSemaphore = new Semaphore(maxConcurrentPages());
 
 async function connectBrowser() {
-  const { browser, page: initialPage } = await connect({
-    headless: true,
+  // Keep the initial page open as a keep-alive tab. puppeteer-real-browser
+  // (headful) fails to create new targets if the browser has zero pages, so
+  // closing it here would break subsequent browser.newPage() calls.
+  const { browser } = await connect({
+    headless: false,
     turnstile: true,
     args: CONNECT_ARGS,
     customConfig: {},
@@ -67,13 +70,6 @@ async function connectBrowser() {
     disableXvfb: false,
     ignoreAllFlags: false,
   });
-  if (initialPage) {
-    try {
-      await initialPage.close();
-    } catch (_) {
-      /* ignore */
-    }
-  }
   browserCreatedAt = Date.now();
   browser.on("disconnected", () => {
     browserInstance = null;
@@ -120,7 +116,7 @@ async function getBrowser() {
 async function withPooledPage(fn) {
   if (!poolEnabled()) {
     const { browser, page } = await connect({
-      headless: true,
+      headless: false,
       turnstile: true,
       args: CONNECT_ARGS,
       customConfig: {},

@@ -6,8 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "benchmark": "node scripts/benchmark-extract.js",
-    "postinstall": "npx puppeteer browsers install chrome",
-    "dev": "vercel dev"
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "keywords": [],
   "author": "93bx",
@@ -20,26 +19,23 @@
     "winston": "^3.19.0",
     "xvfb": "^0.4.0"
   },
-  "devDependencies": {
-    "@vercel/node": "^5.7.15"
-  },
   "overrides": {
     "basic-ftp": "^5.3.1",
     "lodash": "^4.17.24",
-    "qs": "^6.15.1",
-    "tmp": "^0.2.5",
-    "form-data": "^4.0.4",
+    "qs": "^6.15.3",
+    "tmp": "^0.2.7",
+    "form-data": "^4.0.6",
     "follow-redirects": "^1.15.12",
     "brace-expansion": "^1.1.13",
-    "tar": "^7.5.11",
+    "tar": "^7.5.20",
     "tar-fs": "^3.1.2",
     "minimatch": "^3.1.5",
     "ajv": "^8.20.0",
-    "undici": "^6.24.0",
+    "undici": "^6.27.0",
     "smol-toml": "^1.6.1",
-    "@vercel/node": {
-      "path-to-regexp": "^6.3.0"
-    },
+    "fast-uri": "^3.1.4",
+    "ws": "^8.21.1",
+    "js-yaml": "^4.3.0",
     "stremio-addon-sdk": {
       "express": {
         "path-to-regexp": "0.1.13"

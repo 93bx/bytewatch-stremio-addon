@@ -4,4 +4,10 @@
 /beamup.json
 /tester.js
 /beamup.yaml
-package-lock.json
+
+# Generated knowledge graph (graphify)
+/graphify-out/
+
+# Local env / secrets
+.env
+.env.*

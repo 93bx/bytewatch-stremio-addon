@@ -3,7 +3,7 @@
  * Usage (from repo root):
  *   node scripts/benchmark-extract.js
  *   ITERATIONS=3 BENCH_COLD_EACH=1 node scripts/benchmark-extract.js
- *   MODE=extractor TMDB_ID=27205 node scripts/benchmark-extract.js
+ *   MODE=extractor BENCH_IMDB=tt1375666 BENCH_SOURCE=vidfast node scripts/benchmark-extract.js
  */
 const { performance } = require("node:perf_hooks");
 const path = require("path");
@@ -55,16 +55,16 @@ async function runPipelineBench() {
 }
 
 async function runExtractorBench() {
-  const tmdbId = Number(process.env.TMDB_ID || 27205);
+  const imdbId = process.env.BENCH_IMDB || "tt1375666";
   const type = (process.env.BENCH_TYPE || "movie").toLowerCase();
   const season = process.env.BENCH_SEASON != null ? process.env.BENCH_SEASON : null;
   const episode = process.env.BENCH_EPISODE != null ? process.env.BENCH_EPISODE : null;
   const iterations = Math.max(1, Number(process.env.ITERATIONS || 2));
-  const source = process.env.BENCH_SOURCE || "cineby";
+  const source = process.env.BENCH_SOURCE || "vidcore";
   const times = [];
   for (let i = 0; i < iterations; i += 1) {
     const t0 = performance.now();
-    await runExtractor(source, type, tmdbId, season, episode);
+    await runExtractor(source, type, imdbId, season, episode);
     times.push(performance.now() - t0);
   }
   const sorted = [...times].sort((a, b) => a - b);
@@ -76,7 +76,7 @@ async function runExtractorBench() {
   return {
     mode: "extractor",
     source,
-    tmdbId,
+    imdbId,
     type,
     iterations,
     browserPool: poolOn,

@@ -1,0 +1,12 @@
+node_modules
+graphify-out
+.git
+.gitignore
+.idea
+.cursor
+scripts
+*.md
+.env
+.env.*
+Dockerfile
+.dockerignore

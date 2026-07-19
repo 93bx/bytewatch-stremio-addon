@@ -11,7 +11,9 @@ const extractor = require('./unified-extractor');
 const { prewarmPool } = require('./browser-pool');
 
 const PORT = process.env.PORT || 7000;
-const PROTECTED_STREAM_CACHE_TTL = 1800;
+// Short TTL: CDN tokens are session/IP-bound and expire quickly.
+const PROTECTED_STREAM_CACHE_TTL = Number(process.env.STREAM_CACHE_TTL || 300);
+const PER_PROVIDER_CAP = 2;
 const insecureAgent = new https.Agent({ rejectUnauthorized: false });
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`).replace(/\/+$/, '');
 
@@ -30,9 +32,9 @@ const builder = new addonBuilder({
 // Setup cache to reduce load (shorter TTL for protected session-bound links)
 const streamCache = new NodeCache({ stdTTL: PROTECTED_STREAM_CACHE_TTL, checkperiod: 120 });
 const proxySessionCache = new NodeCache({ stdTTL: PROTECTED_STREAM_CACHE_TTL, checkperiod: 120 });
-const tmdbFindCache = new NodeCache({ stdTTL: 86400, checkperiod: 600 });
 
-const ALLOWED_EXTRACTOR_SOURCES = new Set(['cineby', 'vidking']);
+const ALLOWED_EXTRACTOR_SOURCES = new Set(['vidcore', 'vidfast']);
+const OMDB_API_KEY = process.env.OMDB_API_KEY || 'b1e4f11';
 
 function streamTimingEnabled() {
     return process.env.STREAM_TIMING === '1';
@@ -44,15 +46,15 @@ function logStreamTiming(label, startedAt) {
 }
 
 function resolveExtractorSources() {
-    const raw = (process.env.SOURCES || 'cineby,vidking').split(',').map((s) => s.trim()).filter(Boolean);
+    const raw = (process.env.SOURCES || 'vidcore,vidfast').split(',').map((s) => s.trim()).filter(Boolean);
     const picked = raw.filter((s) => ALLOWED_EXTRACTOR_SOURCES.has(s));
-    return picked.length ? picked : ['cineby', 'vidking'];
+    return picked.length ? picked : ['vidcore', 'vidfast'];
 }
 
-// Fetch movie data
+// Fetch movie/series metadata (used only for the stream description).
 async function fetchOmdbDetails(imdbId){
   try {
-    const response = await axios.get(`https://www.omdbapi.com/?i=${imdbId}&apikey=b1e4f11`);
+    const response = await axios.get(`https://www.omdbapi.com/?i=${imdbId}&apikey=${OMDB_API_KEY}`);
      if (response.data.Response === 'False') {
       throw new Error(response.data || 'Failed to fetch data from OMDB API');
      }
@@ -60,34 +62,6 @@ async function fetchOmdbDetails(imdbId){
   } catch (e) {
     console.log(`Error fetching metadata: ${e}`)
     return null
-  }
-}
-
-async function resolveTmdbFind(imdbId) {
-    const cached = tmdbFindCache.get(imdbId);
-    if (cached) return cached;
-    const data = await fetchTmdbId(imdbId);
-    if (data && (data.movie_results?.length || data.tv_results?.length)) {
-        tmdbFindCache.set(imdbId, data);
-    }
-    return data;
-}
-
-// Fetch TMDB ID
-async function fetchTmdbId(imdbId){
-  try {
-      const response = await axios.get(`https://api.themoviedb.org/3/find/${imdbId}?external_source=imdb_id`,
-          {
-              method: 'GET',
-              headers: {
-                  accept: 'application/json',
-                  Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI3M2EyNzkwNWM1Y2IzNjE1NDUyOWNhN2EyODEyMzc0NCIsIm5iZiI6MS43MjM1ODA5NTAwMDg5OTk4ZSs5LCJzdWIiOiI2NmJiYzIxNjI2NmJhZmVmMTQ4YzVkYzkiLCJzY29wZXMiOlsiYXBpX3JlYWQiXSwidmVyc2lvbiI6MX0.y7N6qt4Lja5M6wnFkqqo44mzEMJ60Pzvm0z_TfA1vxk'
-              }
-          });
-      return response.data;
-  } catch (e) {
-      console.log(`Error fetching metadata: ${e}`)
-      return null
   }
 }
 
@@ -110,8 +84,9 @@ function buildProxyUrl(token, targetUrl) {
 
 function mapCandidateToStream(candidate, description) {
     const token = createProxyToken(candidate);
+    const serverSuffix = candidate.server ? ` · ${candidate.server}` : '';
     return {
-        name: `${sourceLabel(candidate.source)} (${candidate.score})`,
+        name: `${sourceLabel(candidate.source)}${serverSuffix} (${candidate.score})`,
         url: buildProxyUrl(token, candidate.url),
         description,
         behaviorHints: {
@@ -126,37 +101,35 @@ function normalizeCached(cached) {
     return [];
 }
 
-// Main extraction function
-async function extractAllStreams({ type, imdbId, season, episode, tmdbRes: tmdbResInput }) {
-    const streams = [];
+// Main extraction function. vidcore/vidfast accept the IMDB id directly, so no
+// TMDB resolution is needed. Providers run in parallel (one browser tab each),
+// contribute up to PER_PROVIDER_CAP streams, and results are deduped by URL
+// (both providers share the same CDN and can return identical links).
+async function extractAllStreams({ type, imdbId, season, episode }) {
     const tExtractStart = performance.now();
-    const tmdbRes = tmdbResInput !== undefined && tmdbResInput !== null
-        ? tmdbResInput
-        : await resolveTmdbFind(imdbId);
-
-    const id = type === 'movie'
-        ? tmdbRes?.movie_results?.[0]?.id
-        : tmdbRes?.tv_results?.[0]?.id;
-
-    if (!id) {
-        console.warn('❌ TMDB ID not found');
-        return streams;
-    }
-
     const sources = resolveExtractorSources();
     const settled = await Promise.allSettled(
-        sources.map((source) => extractor(source, type, id, season, episode))
+        sources.map((source) => extractor(source, type, imdbId, season, episode))
     );
 
-    const results = settled;
-
-    for (const result of results) {
-        if (result.status === 'fulfilled' && result.value && result.value.bestCandidate) {
-            streams.push(result.value.bestCandidate);
-        } else if (result.status === 'rejected') {
+    const streams = [];
+    const seenUrls = new Set();
+    for (const result of settled) {
+        if (result.status === 'rejected') {
             console.warn('❌ source extraction failed:', result.reason?.message);
-        } else if (result.status === 'fulfilled' && result.value) {
+            continue;
+        }
+        if (!result.value) continue;
+        const candidates = Array.isArray(result.value.candidates) ? result.value.candidates : [];
+        if (!candidates.length) {
             console.warn(`❌ ${result.value.source} extraction had no playable candidate: ${result.value.error || 'no candidate'}`);
+            continue;
+        }
+        const top = [...candidates].sort((a, b) => b.score - a.score).slice(0, PER_PROVIDER_CAP);
+        for (const candidate of top) {
+            if (seenUrls.has(candidate.url)) continue;
+            seenUrls.add(candidate.url);
+            streams.push(candidate);
         }
     }
 
@@ -193,10 +166,10 @@ async function getMovieStreams(imdbId) {
     }
 
     const tMeta = performance.now();
-    const [tmdbRes, metadata] = await Promise.all([resolveTmdbFind(imdbId), fetchOmdbDetails(imdbId)]);
-    logStreamTiming('getMovieStreams meta_parallel', tMeta);
+    const metadata = await fetchOmdbDetails(imdbId);
+    logStreamTiming('getMovieStreams meta', tMeta);
 
-    const streams = await extractAllStreams({ type: 'movie', imdbId, tmdbRes });
+    const streams = await extractAllStreams({ type: 'movie', imdbId });
     streamCache.set(cacheKey, streams);
 
     const desc = movieStreamDescription(metadata, imdbId);
@@ -218,10 +191,10 @@ async function getSeriesStreams(imdbId, season, episode) {
     }
 
     const tMeta = performance.now();
-    const [tmdbRes, metadata] = await Promise.all([resolveTmdbFind(imdbId), fetchOmdbDetails(imdbId)]);
-    logStreamTiming('getSeriesStreams meta_parallel', tMeta);
+    const metadata = await fetchOmdbDetails(imdbId);
+    logStreamTiming('getSeriesStreams meta', tMeta);
 
-    const streams = await extractAllStreams({ type: 'series', imdbId, season, episode, tmdbRes });
+    const streams = await extractAllStreams({ type: 'series', imdbId, season, episode });
     streamCache.set(cacheKey, streams);
     const desc = seriesStreamDescription(metadata, imdbId, season, episode);
     logStreamTiming('getSeriesStreams cache_miss_total', tHandler);
@@ -352,7 +325,6 @@ function flushStreamCachesForBenchmark() {
 
 module.exports = {
     extractAllStreams,
-    resolveTmdbFind,
     fetchOmdbDetails,
     flushStreamCachesForBenchmark,
 };

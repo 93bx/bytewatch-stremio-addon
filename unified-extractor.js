@@ -7,7 +7,8 @@ const { withPooledPage } = require("./browser-pool");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const insecureAgent = new https.Agent({ rejectUnauthorized: false });
 
-const MANIFEST_MAX_BYTES = 98304;
+// Large media playlists (long movies at ~2s segments) can be several MB.
+const MANIFEST_MAX_BYTES = 12 * 1024 * 1024;
 const VERIFY_CONCURRENCY = 3;
 
 function streamTimingEnabled() {
@@ -58,6 +59,18 @@ function getSettlePollMs() {
   return Math.min(50, Math.max(10, getMediaStabilityMs()));
 }
 
+function multiServerEnabled() {
+  return process.env.MULTISERVER !== "0";
+}
+
+// Best-effort budget for the alternate-server switch; default is always
+// returned fast and we only add a 2nd server if it resolves within this window.
+function getServerSwitchBudgetMs() {
+  return Number(process.env.SERVER_SWITCH_BUDGET_MS || 12000);
+}
+
+const SERVER_ROW_SELECTOR = "div.mui-1uvfm1d";
+
 async function mapWithConcurrency(items, limit, fn) {
   if (!items.length) return;
   let next = 0;
@@ -101,67 +114,33 @@ const blockedMarkers = [
   "dtscout",
 ];
 
-const DEFAULT_EXTRA_BLOCK_SUBSTRINGS = [
-  "googletagmanager.com",
-  "google-analytics.com",
-  "doubleclick.net",
-  "googleads.g.doubleclick.net",
-  "facebook.net/tr",
-  "scorecardresearch.com",
-];
+// Hosts we always allow: the player site itself (+ www), the shared media CDN,
+// and the flag-icon host used by the server-picker rows.
+const MEDIA_CDN_SUFFIX = "ironwallnet.net";
+const FLAG_HOST = "flagsapi.com";
 
-function parseEnvList(envVal, fallback) {
-  if (!envVal || !String(envVal).trim()) return [...fallback];
-  return String(envVal)
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function firstPartyHostnames(playerUrl, source) {
+function firstPartyHostnames(playerUrl) {
   const hosts = new Set();
   try {
     const { hostname } = new URL(playerUrl);
-    hosts.add(hostname);
-    if (hostname.startsWith("www.")) {
-      hosts.add(hostname.slice(4));
-    } else {
-      hosts.add(`www.${hostname}`);
-    }
+    const bare = hostname.replace(/^www\./, "");
+    hosts.add(bare);
+    hosts.add(`www.${bare}`);
   } catch (_) {
     /* ignore */
-  }
-  if (source === "cineby") {
-    hosts.add("www.cineby.sc");
-    hosts.add("cineby.sc");
-  }
-  if (source === "vidking") {
-    hosts.add("www.vidking.net");
-    hosts.add("vidking.net");
   }
   return hosts;
 }
 
-function resourceTypesToBlock() {
-  return new Set(
-    parseEnvList(process.env.BLOCK_RESOURCE_TYPES, ["image", "font"]).map((s) =>
-      s.toLowerCase()
-    )
-  );
-}
-
-function extraBlockSubstrings() {
-  return parseEnvList(process.env.BLOCK_EXTRA_PATTERNS, DEFAULT_EXTRA_BLOCK_SUBSTRINGS);
-}
-
+/**
+ * Allow-list blocking: keep the player site + media CDN + flag icons, block
+ * every other third party. This strips the ad/popunder scripts whose global
+ * click interceptor otherwise "eats" the server-menu clicks (and is the
+ * ad-blocking we want anyway). Analytics subdomains of the site are blocked.
+ */
 function shouldBlockRequest(request, playerUrl, source, blockStats) {
   const reqUrl = request.url();
   if (looksLikeMedia(reqUrl)) return null;
-
-  if (blockedMarkers.some((marker) => reqUrl.includes(marker))) {
-    if (blockStats) blockStats.marker += 1;
-    return "marker";
-  }
 
   let hostname = "";
   try {
@@ -170,36 +149,34 @@ function shouldBlockRequest(request, playerUrl, source, blockStats) {
     return null;
   }
 
-  const firstParty = firstPartyHostnames(playerUrl, source);
+  if (hostname.startsWith("umami.")) {
+    if (blockStats) blockStats.marker += 1;
+    return "analytics";
+  }
+
+  const firstParty = firstPartyHostnames(playerUrl);
   if (firstParty.has(hostname)) return null;
+  if (hostname === MEDIA_CDN_SUFFIX || hostname.endsWith(`.${MEDIA_CDN_SUFFIX}`)) return null;
+  if (hostname === FLAG_HOST) return null;
 
-  const rt = request.resourceType();
-  const typeSet = resourceTypesToBlock();
-  if (typeSet.has(rt)) {
-    if (blockStats) blockStats.byType[rt] = (blockStats.byType[rt] || 0) + 1;
-    return `type:${rt}`;
-  }
-
-  for (const sub of extraBlockSubstrings()) {
-    if (sub && reqUrl.includes(sub)) {
-      if (blockStats) blockStats.pattern += 1;
-      return `pattern:${sub}`;
-    }
-  }
-
-  return null;
+  if (blockStats) blockStats.pattern += 1;
+  return "third-party";
 }
 
 const sourceUrlBuilders = {
-  cineby: (type, id, season, episode) =>
+  vidcore: (type, id, season, episode) =>
     type === "movie"
-      ? `https://www.cineby.sc/movie/${id}`
-      : `https://www.cineby.sc/tv/${id}/${season}/${episode}`,
-  vidking: (type, id, season, episode) =>
+      ? `https://vidcore.net/movie/${id}`
+      : `https://vidcore.net/tv/${id}/${season}/${episode}`,
+  vidfast: (type, id, season, episode) =>
     type === "movie"
-      ? `https://www.vidking.net/embed/movie/${id}`
-      : `https://www.vidking.net/embed/tv/${id}/${season}/${episode}`,
+      ? `https://vidfast.vc/movie/${id}`
+      : `https://vidfast.vc/tv/${id}/${season}/${episode}`,
 };
+
+function siteBaseUrl(source) {
+  return source === "vidcore" ? "https://vidcore.net" : "https://vidfast.vc";
+}
 
 function randomUserAgent() {
   const versions = ["127.0.0.0", "126.0.0.0", "125.0.0.0"];
@@ -218,13 +195,10 @@ function looksLikeMedia(url) {
 }
 
 function buildProxyHeaders(rawHeaders = {}, source) {
+  const base = siteBaseUrl(source);
   return {
-    Referer:
-      rawHeaders.referer ||
-      `https://${source === "cineby" ? "www.cineby.sc" : source === "vidking" ? "www.vidking.net" : "vsembed.ru"}/`,
-    Origin:
-      rawHeaders.origin ||
-      `https://${source === "cineby" ? "www.cineby.sc" : source === "vidking" ? "www.vidking.net" : "vsembed.ru"}`,
+    Referer: rawHeaders.referer || `${base}/`,
+    Origin: rawHeaders.origin || base,
     "User-Agent": rawHeaders["user-agent"] || randomUserAgent(),
     "Accept-Language": rawHeaders["accept-language"] || "en-US,en;q=0.9",
   };
@@ -377,6 +351,100 @@ async function verifyCandidatesWithMode(candidates) {
   });
 }
 
+/**
+ * Best-effort in-player server switch. Starts playback, opens the top-left
+ * cloud menu, and clicks the first non-selected server row, then waits (bounded
+ * by budgetMs) for a NEW distinct media URL to appear via the request sniffer.
+ * Returns { defaultServerName, altServerName, altUrls } (altUrls may be empty).
+ */
+async function switchToAlternateServer(page, settleState, budgetMs) {
+  const result = { defaultServerName: null, altServerName: null, altUrls: new Set() };
+  const vp = page.viewport() || { width: 1280, height: 720 };
+  const cx = Math.round(vp.width / 2);
+  const cy = Math.round(vp.height / 2);
+
+  // Autoplay is gesture-gated; a center click starts playback.
+  try {
+    await page.mouse.click(cx, cy);
+  } catch (_) {
+    /* ignore */
+  }
+  await sleep(500);
+
+  const btn = await page.evaluate(() => {
+    const b = [...document.querySelectorAll("button")].find((el) => el.querySelector("img[title]"));
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  });
+  if (!btn) return result;
+
+  // Open the menu (real click); retry once if rows do not expand.
+  let rows = [];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await page.mouse.move(cx, cy);
+      await sleep(100);
+      await page.mouse.move(btn.x, btn.y);
+      await sleep(120);
+      await page.mouse.click(btn.x, btn.y);
+    } catch (_) {
+      /* ignore */
+    }
+    await sleep(650);
+    rows = await page.evaluate((sel) =>
+      [...document.querySelectorAll("img[title]")]
+        .map((i) => {
+          const row = i.closest(sel);
+          if (!row) return null;
+          const r = row.getBoundingClientRect();
+          return {
+            name: i.getAttribute("title"),
+            x: Math.round(r.left + r.width / 2),
+            y: Math.round(r.top + r.height / 2),
+            h: Math.round(r.height),
+            selected: !!row.querySelector("svg.mui-13f5dvg"),
+          };
+        })
+        .filter(Boolean), SERVER_ROW_SELECTOR);
+    if (rows.some((r) => r.h > 0)) break;
+  }
+
+  const visible = rows.filter((r) => r.h > 0);
+  if (!visible.length) return result;
+  const selectedRow = visible.find((r) => r.selected) || visible[0];
+  result.defaultServerName = selectedRow.name;
+  const target = visible.find((r) => !r.selected && r.name !== selectedRow.name) || visible[1];
+  if (!target) return result;
+  result.altServerName = target.name;
+
+  const known = new Set(settleState.seen);
+  try {
+    await page.mouse.move(target.x, target.y);
+    await sleep(120);
+    await page.mouse.click(target.x, target.y);
+  } catch (_) {
+    /* ignore */
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < budgetMs) {
+    for (const u of settleState.seen) {
+      if (!known.has(u) && u.includes(".m3u8")) result.altUrls.add(u);
+    }
+    if (result.altUrls.size > 0) {
+      // let the alternate manifest's variants settle briefly, then stop.
+      await sleep(400);
+      for (const u of settleState.seen) {
+        if (!known.has(u) && u.includes(".m3u8")) result.altUrls.add(u);
+      }
+      break;
+    }
+    await sleep(150);
+  }
+  return result;
+}
+
 async function runSourceExtraction(source, type, id, season, episode) {
   const playerUrl = sourceUrlBuilders[source](type, id, season, episode);
   const hits = [];
@@ -398,6 +466,11 @@ async function runSourceExtraction(source, type, id, season, episode) {
 
     try {
       await page.setUserAgent(ua);
+      try {
+        await page.setViewport({ width: 1280, height: 720 });
+      } catch (_) {
+        /* ignore */
+      }
       await page.setExtraHTTPHeaders({
         DNT: "1",
         "Sec-GPC": "1",
@@ -462,6 +535,23 @@ async function runSourceExtraction(source, type, id, season, episode) {
       );
       logExtractorTiming(`${source}.media_settled`, tSettle);
 
+      // Best-effort: switch to a second server for an additional distinct stream.
+      let altUrls = new Set();
+      let defaultServerName = null;
+      let altServerName = null;
+      if (multiServerEnabled() && settleState.distinctCount > 0) {
+        const tSwitch = performance.now();
+        try {
+          const sw = await switchToAlternateServer(page, settleState, getServerSwitchBudgetMs());
+          altUrls = sw.altUrls;
+          defaultServerName = sw.defaultServerName;
+          altServerName = sw.altServerName;
+        } catch (_) {
+          /* best-effort; default stream is already captured */
+        }
+        logExtractorTiming(`${source}.server_switch alt=${altUrls.size}`, tSwitch);
+      }
+
       if (blockStats && streamTimingEnabled()) {
         logger.info(
           `timing extractor.${source}.block_stats marker=${blockStats.marker} pattern=${blockStats.pattern} byType=${JSON.stringify(blockStats.byType)}`
@@ -475,16 +565,39 @@ async function runSourceExtraction(source, type, id, season, episode) {
       const candidates = Array.from(dedup.values()).filter(
         (item) => item.url.includes(".m3u8") || item.url.includes(".mp4")
       );
+      for (const c of candidates) {
+        c.serverGroup = altUrls.has(c.url) ? "alt" : "default";
+        c.server = c.serverGroup === "alt" ? altServerName : defaultServerName;
+      }
+
+      // Pick one representative per server group BEFORE verifying, so we verify
+      // exactly the streams we return (prefer the master/playlist manifest).
+      const isMaster = (u) => u.includes("/master") || u.includes("/playlist");
+      const byGroup = new Map();
+      for (const c of candidates) {
+        const cur = byGroup.get(c.serverGroup);
+        if (!cur) {
+          byGroup.set(c.serverGroup, c);
+          continue;
+        }
+        const better =
+          (isMaster(c.url) && !isMaster(cur.url)) ||
+          (isMaster(c.url) === isMaster(cur.url) && c.url.length < cur.url.length);
+        if (better) byGroup.set(c.serverGroup, c);
+      }
+      const representatives = Array.from(byGroup.values());
 
       const tVerify = performance.now();
-      await verifyCandidatesWithMode(candidates);
-      logExtractorTiming(`${source}.verify_candidates n=${candidates.length}`, tVerify);
+      await verifyCandidatesWithMode(representatives);
+      logExtractorTiming(`${source}.verify_candidates n=${representatives.length}`, tVerify);
+
+      const finalCandidates = representatives.sort((a, b) => b.score - a.score);
 
       return {
         source,
         playerUrl,
-        candidates,
-        bestCandidate: bestCandidate(candidates),
+        candidates: finalCandidates,
+        bestCandidate: bestCandidate(finalCandidates),
         error: null,
       };
     } catch (error) {
